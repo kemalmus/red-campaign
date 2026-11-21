@@ -1,7 +1,7 @@
-import { NTFY_TOPIC, NTFY_BASE, KALE_MODEL, KALE_FRONTEND, DEFAULT_VOICE, WORKER_URL } from "./config.js?v=20261121i";
-import { KaleTTS } from "./vendor/kale-tts.mjs?v=20261121i";
+import { NTFY_TOPIC, NTFY_BASE, KALE_MODEL, KALE_FRONTEND, DEFAULT_VOICE, WORKER_URL } from "./config.js?v=20261121j";
+import { KaleTTS } from "./vendor/kale-tts.mjs?v=20261121j";
 
-const ASSET_V = "20261121i";
+const ASSET_V = "20261121j";
 const SILENCE =
   "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
 const MODEL_URL = `${KALE_MODEL}kale-tts-1-nano.onnx`;

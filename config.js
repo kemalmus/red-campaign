@@ -5,6 +5,5 @@ export const KALE_MODEL = "https://huggingface.co/KaleComputer/kale-tts-1-nano/r
 export const KALE_FRONTEND = "https://huggingface.co/KaleComputer/kale-tts-1-nano/resolve/main/frontend/";
 export const DEFAULT_VOICE = "magnus";
 
-// Cloudflare Worker relay. Empty = send through ntfy + box relay (current path).
-// Set to the deployed Worker URL (no trailing slash) only after it is verified.
-export const WORKER_URL = "";
+// Cloudflare Worker relay. The box ntfy relay stays as a fallback for history echoes.
+export const WORKER_URL = "https://red-campaign-relay.normalizacja.workers.dev";

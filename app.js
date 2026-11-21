@@ -389,7 +389,6 @@ async function loadHistory() {
   events.sort((a, b) => (a.ts || 0) - (b.ts || 0));
   for (const ev of events) {
     // History is shown, never auto-spoken (avoids stale / test lines on open).
-    if (isTestEvent(ev)) continue;
     renderEvent(ev, { speak: false });
   }
 }

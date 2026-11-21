@@ -1,12 +1,12 @@
-import { NTFY_TOPIC, NTFY_BASE, KALE_MODEL, KALE_FRONTEND, DEFAULT_VOICE } from "./config.js?v=20261121g";
-import { KaleTTS } from "./vendor/kale-tts.mjs?v=20261121g";
+import { NTFY_TOPIC, NTFY_BASE, KALE_MODEL, KALE_FRONTEND, DEFAULT_VOICE } from "./config.js?v=20261121h";
+import { KaleTTS } from "./vendor/kale-tts.mjs?v=20261121h";
 
-const ASSET_V = "20261121g";
+const ASSET_V = "20261121h";
 const SILENCE =
   "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
 const MODEL_URL = `${KALE_MODEL}kale-tts-1-nano.onnx`;
 const REPLY_TIMEOUT_MS = 180000;
-const ACK_TIMEOUT_MS = 30000;
+const ACK_TIMEOUT_MS = 45000;
 const SLOW_RELAY_S = 12;
 const NO_DELIVERY_MS = 180000;
 
@@ -343,7 +343,7 @@ function setMoveStage(id, stage, extra = {}) {
     move.ackTimer = setTimeout(() => {
       if (moves.get(id)?.stage === "sending") {
         setMoveStage(id, "error", {
-          error: "SEND NOT CONFIRMED",
+          error: "SEND FAILED · NO ANSWER FROM CHANNEL",
           retryMode: "resend",
         });
       }
@@ -860,16 +860,78 @@ function connectChannel() {
   pollTimer = setInterval(pollOnce, 2000);
 }
 
+class PublishError extends Error {
+  constructor(reason, detail) {
+    super(reason);
+    this.reason = reason;      // short text shown to the user
+    this.detail = detail || "";
+  }
+}
+
+function describeFetchFailure(err) {
+  const name = err && err.name;
+  if (name === "AbortError") return "TIMEOUT (10S, NO ANSWER)";
+  if (navigator.onLine === false) return "OFFLINE";
+  const m = String((err && err.message) || "").toLowerCase();
+  if (m.includes("load failed") || m.includes("failed to fetch") || m.includes("networkerror")) {
+    return "NETWORK (LOAD FAILED — BLOCKED OR NO SIGNAL)";
+  }
+  return "NETWORK (" + String((err && err.message) || name || "UNKNOWN").slice(0, 40).toUpperCase() + ")";
+}
+
+async function publishOnce(body, test) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 10000);
+  let r;
+  try {
+    r = await fetch(`${NTFY_BASE}/${encodeURIComponent(NTFY_TOPIC)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Title: test ? "test-action" : "action" },
+      body: JSON.stringify(body),
+      signal: ctl.signal,
+      cache: "no-store",
+    });
+  } catch (err) {
+    throw new PublishError(describeFetchFailure(err), String(err && err.message || err));
+  } finally {
+    clearTimeout(timer);
+  }
+  if (r.ok) return;
+  const retryAfter = Number(r.headers.get("retry-after")) || 0;
+  let why = `HTTP ${r.status}`;
+  if (r.status === 429) why += retryAfter ? ` (RATE LIMITED — RETRY IN ${retryAfter}S)` : " (RATE LIMITED)";
+  else if (r.status >= 500) why += " (CHANNEL SERVER ERROR)";
+  else if (r.status === 403 || r.status === 401) why += " (CHANNEL REFUSED)";
+  const e = new PublishError(why, "http " + r.status);
+  e.status = r.status;
+  e.retryAfter = retryAfter;
+  throw e;
+}
+
+// Same id on every attempt, so a retry can never become a second move
+// (the relay dedupes by id as well).
 async function publishAction(id, text, chosenVoice, test = false, via = "") {
   const body = { type: "action", id, text, voice: chosenVoice, build: ASSET_V };
   if (via) body.via = via;
   if (test) body.test = true;
-  const r = await fetch(`${NTFY_BASE}/${encodeURIComponent(NTFY_TOPIC)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Title: test ? "test-action" : "action" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) throw new Error("channel " + r.status);
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await publishOnce(body, test);
+      return;
+    } catch (err) {
+      lastErr = err;
+      const retriable = !err.status || err.status === 429 || err.status >= 500;
+      if (!retriable || attempt === 3) break;
+      const wait = err.status === 429 ? Math.min(6, Math.max(1, err.retryAfter || 2)) : attempt;
+      const move = moves.get(id);
+      if (move && move.stageEl && move.stage === "sending") {
+        move.stageEl.textContent = `SENDING… RETRY ${attempt + 1}/3 (${err.reason})`;
+      }
+      await new Promise((r) => setTimeout(r, wait * 1000));
+    }
+  }
+  throw lastErr;
 }
 
 async function retryMove(id) {
@@ -892,7 +954,8 @@ async function retryMove(id) {
     if (moves.get(id)?.stage === "sending") setMoveStage(id, "sent", { sentOkAt: Date.now() });
   } catch (err) {
     publishedIds.delete(id);
-    setMoveStage(id, "error", { error: "SEND FAILED", retryMode: "resend" });
+    setMoveStage(id, "error", { error: "SEND FAILED · " + (err.reason || String(err.message || err).toUpperCase()), retryMode: "resend" });
+    console.warn("publish failed", err.detail || err);
   }
 }
 
@@ -936,6 +999,13 @@ function captureSend(via = "") {
   scrollToLatest();
   // collapse the field after the gesture is over, never under a finger
   setTimeout(() => { if (!input.value) input.style.height = "auto"; }, 500);
+  // The gesture lock lasts ~1.3 s and is independent of the network: a slow or
+  // hung publish must never leave Send disabled (each move has its own id).
+  setTimeout(() => {
+    sendInFlight = false;
+    sendBtn.disabled = false;
+    sendBtn.textContent = "SEND";
+  }, 1300);
   return ev;
 }
 
@@ -948,20 +1018,11 @@ async function dispatchSend(ev) {
     if (moves.get(ev.id)?.stage === "sending") setMoveStage(ev.id, "sent", { sentOkAt: Date.now() });
   } catch (err) {
     publishedIds.delete(ev.id);
-    setMoveStage(ev.id, "error", { error: "SEND FAILED", retryMode: "resend" });
-    console.warn(err);
-  } finally {
-    sendInFlight = false;
-    const remain = Math.max(0, sendLockUntil - Date.now());
-    setTimeout(() => {
-      if (!sendInFlight) {
-        sendBtn.disabled = false;
-        sendBtn.textContent = "SEND";
-      }
-    }, remain + 350);
-    if (document.activeElement !== input) {
-      try { input.focus({ preventScroll: true }); } catch (_) { input.focus(); }
-    }
+    setMoveStage(ev.id, "error", {
+      error: "SEND FAILED · " + (err.reason || String(err.message || err).toUpperCase()),
+      retryMode: "resend",
+    });
+    console.warn("publish failed", err.detail || err);
   }
 }
 
@@ -1005,8 +1066,9 @@ input.addEventListener("input", () => {
   input.style.height = Math.min(input.scrollHeight, 160) + "px";
   // A new draft means the previous gesture is over; don't keep Send locked
   // after the leftover iOS click window if the user is already typing again.
-  if (input.value.trim() && !sendInFlight) {
+  if (input.value.trim()) {   // typing a new draft = new intent; unlock immediately
     sendLockUntil = 0;
+    sendInFlight = false;
     sendBtn.disabled = false;
     sendBtn.textContent = "SEND";
   }

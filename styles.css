@@ -1,4 +1,4 @@
-/* cache-bust: 20261121e */
+/* cache-bust: 20261121f */
 :root {
   --bg: #161311;
   --bg-2: #1c1916;
@@ -359,17 +359,23 @@ h1 {
 #send {
   min-width: 84px;
   min-height: 56px;
+  height: 56px;
   padding: 0 16px;
   font-size: 16px;
   color: var(--ink);
   background: var(--red);
   border: 1px solid var(--red-dark);
   cursor: pointer;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: rgba(222, 10, 31, 0.25);
 }
 
 #send:active {
   background: var(--red-dark);
-  transform: translateY(1px);
+  filter: brightness(0.9);
 }
 
 #send:disabled {
@@ -478,7 +484,7 @@ h1 {
   color: var(--muted);
 }
 
-/* ---- UX 20261121e: status, stages, play, dock ---- */
+/* ---- UX 20261121f: status, stages, play, dock ---- */
 :root { --kb: 0px; }
 
 button, .icon-btn, .replay, .play-btn, .retry-btn, .status-stop, #enter, #send {

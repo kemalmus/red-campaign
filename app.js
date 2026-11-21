@@ -1,7 +1,7 @@
-import { NTFY_TOPIC, NTFY_BASE, KALE_MODEL, KALE_FRONTEND, DEFAULT_VOICE } from "./config.js?v=20261121e";
-import { KaleTTS } from "./vendor/kale-tts.mjs?v=20261121e";
+import { NTFY_TOPIC, NTFY_BASE, KALE_MODEL, KALE_FRONTEND, DEFAULT_VOICE } from "./config.js?v=20261121f";
+import { KaleTTS } from "./vendor/kale-tts.mjs?v=20261121f";
 
-const ASSET_V = "20261121e";
+const ASSET_V = "20261121f";
 const SILENCE =
   "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
 const MODEL_URL = `${KALE_MODEL}kale-tts-1-nano.onnx`;
@@ -148,38 +148,39 @@ async function unlockAudio() {
   }
 }
 
+function peelJson(value) {
+  let v = value;
+  for (let i = 0; i < 3; i++) {
+    if (typeof v !== "string") return v;
+    const s = v.trim();
+    if (!s || (s[0] !== "{" && s[0] !== "[" && s[0] !== '"')) return v;
+    try { v = JSON.parse(s); } catch { return v; }
+  }
+  return v;
+}
+
 function parseNtfy(raw) {
-  let data = raw;
-  if (typeof raw === "string") {
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      return null;
-    }
-  }
-  if (!data) return null;
-  if (data.event && data.event !== "message") {
-    if (data.message == null) return null;
-  }
-  let payload = data.message;
+  let data = peelJson(raw);
+  if (!data || typeof data !== "object") return null;
+  if (data.event && data.event !== "message" && data.message == null) return null;
+  // Envelope from ntfy (poll/SSE) has .message; a bare payload also works.
+  const hasEnvelope = data.message != null && (data.event || data.topic || data.time);
+  let payload = hasEnvelope ? peelJson(data.message) : (data.type || data.stage ? data : peelJson(data.message));
   if (typeof payload === "string") {
-    try {
-      payload = JSON.parse(payload);
-    } catch {
-      payload = { type: "narration", id: data.id, text: payload };
-    }
+    payload = { type: "narration", id: data.id, text: payload };
   }
   if (!payload || typeof payload !== "object") return null;
   const ev = {
-    type: payload.type || "narration",
-    id: String(payload.id || data.id || ""),
+    type: payload.type || (payload.stage ? "ack" : "narration"),
+    id: String(payload.id || ""),
     text: String(payload.text || ""),
     voice: payload.voice,
     stage: payload.stage,
     test: payload.test === true,
-    ts: data.time || Date.now() / 1000,
-    ntfyId: data.id,
+    ts: data.time || payload.ts || Date.now() / 1000,
+    ntfyId: hasEnvelope ? data.id : data.ntfyId,
   };
+  if (!ev.id && ev.type === "narration") ev.id = String(data.id || "");
   if (!ev.id) return null;
   if (ev.type === "ack") return ev;
   if (!ev.text) return null;
@@ -336,9 +337,63 @@ function tickBars() {
   if (current && current.stage === "writing") refreshStatusBar();
 }
 
+function escapeAttr(id) {
+  if (window.CSS && CSS.escape) return CSS.escape(String(id));
+  return String(id).replace(/"/g, "");
+}
+
+function actionRowEl(id) {
+  if (!id) return null;
+  return logEl.querySelector(`.msg.action[data-id="${escapeAttr(id)}"]`);
+}
+
+function rememberMove(id, move) {
+  if (!id || !move) return;
+  moves.set(id, move);
+}
+
+// One YOU bubble per move id. If a just-sent local echo comes back from
+// ntfy/history with a mismatched id, reuse the in-flight row instead of
+// appending a second copy of the same text.
+function findExistingAction(ev) {
+  if (ev && ev.id) {
+    const byId = moves.get(ev.id);
+    if (byId && byId.el) return byId;
+    const el = actionRowEl(ev.id);
+    if (el) {
+      const move = byId || { id: ev.id, el, stageEl: el.querySelector(".stage"), stage: "idle" };
+      move.el = el;
+      rememberMove(ev.id, move);
+      return move;
+    }
+  }
+  const text = String(ev && ev.text || "").trim();
+  if (!text || text === "…") return null;
+  const now = Date.now();
+  for (const move of [...moves.values()].reverse()) {
+    if (!move || !move.el) continue;
+    if (String(move.text || "").trim() !== text) continue;
+    const age = now - (move.sentAt || 0);
+    const inFlight = ["sending", "delivered", "writing"].includes(move.stage);
+    if (inFlight && age < 20000) return move;
+  }
+  return null;
+}
+
 function ensureActionRow(ev) {
-  let move = moves.get(ev.id);
-  if (move && move.el) return move;
+  let move = findExistingAction(ev);
+  if (move && move.el) {
+    if (ev.id && ev.id !== move.id) rememberMove(ev.id, move);
+    if (ev.text && ev.text !== "…" && (!move.text || move.text === "…")) {
+      move.text = ev.text;
+      const body = move.el.querySelector(".body");
+      if (body) body.textContent = ev.text;
+    }
+    return move;
+  }
+  if (ev.id && actionRowEl(ev.id)) {
+    return findExistingAction(ev);
+  }
   const row = document.createElement("article");
   row.className = "msg action" + (isTestEvent(ev) ? " test" : "");
   row.dataset.id = ev.id;
@@ -365,15 +420,13 @@ function ensureActionRow(ev) {
     stageEl,
     stage: move?.stage || "idle",
   });
-  moves.set(ev.id, move);
+  rememberMove(ev.id, move);
   return move;
 }
 
 function renderNarration(ev) {
-  if (logEl.querySelector(`.msg.narration[data-id="${ev.id}"][data-ntfy="${ev.ntfyId || ""}"]`)) return;
-  if (logEl.querySelector(`.msg.narration[data-id="${ev.id}"]`) && !ev.ntfyId) return;
-  const existing = logEl.querySelector(`.msg.narration[data-id="${ev.id}"]`);
-  if (existing && ev.id) return existing;
+  const existing = ev.id && logEl.querySelector(`.msg.narration[data-id="${escapeAttr(ev.id)}"]`);
+  if (existing) return existing;
   const row = document.createElement("article");
   row.className = "msg narration" + (isTestEvent(ev) ? " test" : "");
   row.dataset.id = ev.id;
@@ -729,15 +782,22 @@ async function pollOnce() {
   }
 }
 
+let eventSource = null;
+
 function connectChannel() {
   const url = `${NTFY_BASE}/${encodeURIComponent(NTFY_TOPIC)}/sse`;
+  if (eventSource) {
+    try { eventSource.close(); } catch (_) {}
+    eventSource = null;
+  }
   const es = new EventSource(url);
-  const onMsg = (e) => {
+  eventSource = es;
+  // A single listener only: onmessage AND addEventListener("message") would
+  // both fire for the same ntfy event in Safari.
+  es.onmessage = (e) => {
     const ev = parseNtfy(e.data);
     if (ev) handleEvent(ev, { historic: false });
   };
-  es.addEventListener("message", onMsg);
-  es.onmessage = onMsg;
   es.onopen = () => setLinkStatus("on", "LIVE");
   es.onerror = () => setLinkStatus("wait", "RECONNECT");
   if (pollTimer) clearInterval(pollTimer);
@@ -776,31 +836,42 @@ async function retryMove(id) {
 
 const publishedIds = new Set();
 let sendInFlight = false;
+let sendLockUntil = 0;
 
 function newMoveId() {
   return (crypto.randomUUID && crypto.randomUUID().replace(/-/g, "")) ||
     Math.random().toString(16).slice(2) + Date.now().toString(16);
 }
 
-// Capture the move synchronously on the first tap: disable Send, clear the
-// field, and show SENDING before any await. A second tap then cannot start
-// another send (iOS often fires a delayed click, or the first tap was only
-// unlocking audio / dismissing the keyboard).
+// Capture the move on the first pointer/touch: disable Send immediately,
+// keep the textarea focused, and do not wait for click. A leftover click,
+// a second event from the same gesture, or a second tap while in-flight
+// cannot start another send.
 function captureSend() {
-  if (sendInFlight || sendBtn.disabled) return null;
+  const now = Date.now();
+  if (sendInFlight || sendBtn.disabled || now < sendLockUntil) return null;
   const text = input.value.trim();
   if (!text) return null;
   sendInFlight = true;
+  sendLockUntil = now + 1000;
   sendBtn.disabled = true;
   input.value = "";
-  input.style.height = "auto";
+  // Delay collapsing the field so the Send button does not move under a
+  // still-down finger if the textarea was taller than one line.
+  requestAnimationFrame(() => {
+    setTimeout(() => {
+      if (!input.value) input.style.height = "auto";
+    }, 350);
+  });
   const ev = {
     type: "action",
     id: newMoveId(),
     text,
     voice: voiceSel.value,
     ts: Date.now() / 1000,
+    test: isTestEvent({ text }),
   };
+  ev.local = true;
   ensureActionRow(ev);
   setMoveStage(ev.id, "sending");
   scrollToLatest();
@@ -820,9 +891,26 @@ async function dispatchSend(ev) {
     console.warn(err);
   } finally {
     sendInFlight = false;
-    sendBtn.disabled = false;
-    input.focus();
+    const remain = Math.max(0, sendLockUntil - Date.now());
+    setTimeout(() => {
+      if (!sendInFlight) sendBtn.disabled = false;
+    }, remain);
+    if (document.activeElement !== input) {
+      try { input.focus({ preventScroll: true }); } catch (_) { input.focus(); }
+    }
   }
+}
+
+function onSendPointer(e) {
+  if (e.type === "pointerdown" && e.button != null && e.button !== 0) return;
+  // preventDefault on touchstart/pointerdown (not touchend) is what stops
+  // iOS Safari from using the first tap only to blur the textarea and
+  // dismiss the keyboard — which shifts the composer and drops the click.
+  if (e.cancelable) e.preventDefault();
+  if (e.stopPropagation) e.stopPropagation();
+  resumeAudio();
+  const ev = captureSend();
+  if (ev) dispatchSend(ev);
 }
 
 form.addEventListener("submit", (e) => {
@@ -832,26 +920,27 @@ form.addEventListener("submit", (e) => {
   if (ev) dispatchSend(ev);
 });
 
-// First tap on iOS: don't wait for the delayed click, and prevent that click
-// from submitting a second copy of the same move.
-sendBtn.addEventListener("pointerdown", () => resumeAudio());
-sendBtn.addEventListener("touchend", (e) => {
-  e.preventDefault();
-  resumeAudio();
-  const ev = captureSend();
-  if (ev) dispatchSend(ev);
-}, { passive: false });
+sendBtn.addEventListener("pointerdown", onSendPointer, { passive: false });
+sendBtn.addEventListener("touchstart", onSendPointer, { passive: false });
 
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
-    form.requestSubmit();
+    resumeAudio();
+    const ev = captureSend();
+    if (ev) dispatchSend(ev);
   }
 });
 
 input.addEventListener("input", () => {
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 160) + "px";
+  // A new draft means the previous gesture is over; don't keep Send locked
+  // after the leftover iOS click window if the user is already typing again.
+  if (input.value.trim() && !sendInFlight) {
+    sendLockUntil = 0;
+    sendBtn.disabled = false;
+  }
 });
 input.addEventListener("focus", syncKeyboard);
 
@@ -910,10 +999,14 @@ window.__netlink = {
   dispatchSend,
   setMoveStage,
   ensureActionRow,
+  findExistingAction,
   handleEvent,
+  loadHistory,
   parseNtfy,
   audioCache,
   playNarration,
   stopPlayback,
   isTestEvent,
+  get sendInFlight() { return sendInFlight; },
+  get sendLockUntil() { return sendLockUntil; },
 };

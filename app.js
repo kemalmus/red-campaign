@@ -1,7 +1,7 @@
-import { NTFY_TOPIC, NTFY_BASE, KALE_MODEL, KALE_FRONTEND, DEFAULT_VOICE } from "./config.js?v=20261121h";
-import { KaleTTS } from "./vendor/kale-tts.mjs?v=20261121h";
+import { NTFY_TOPIC, NTFY_BASE, KALE_MODEL, KALE_FRONTEND, DEFAULT_VOICE, WORKER_URL } from "./config.js?v=20261121i";
+import { KaleTTS } from "./vendor/kale-tts.mjs?v=20261121i";
 
-const ASSET_V = "20261121h";
+const ASSET_V = "20261121i";
 const SILENCE =
   "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
 const MODEL_URL = `${KALE_MODEL}kale-tts-1-nano.onnx`;
@@ -879,7 +879,70 @@ function describeFetchFailure(err) {
   return "NETWORK (" + String((err && err.message) || name || "UNKNOWN").slice(0, 40).toUpperCase() + ")";
 }
 
+function getPassphrase(force = false) {
+  let pass = force ? "" : (localStorage.getItem("campaign_pass") || "");
+  if (!pass) {
+    pass = (window.prompt("Passphrase for this campaign page (asked once on this device):") || "").trim();
+    if (pass) localStorage.setItem("campaign_pass", pass);
+  }
+  return pass;
+}
+
+const WORKER_ERRORS = {
+  bad_passphrase: "WRONG PASSPHRASE",
+  bad_origin: "RELAY REFUSED THIS PAGE",
+  bad_text: "MESSAGE EMPTY OR TOO LONG",
+  bad_id: "BAD MESSAGE ID",
+  too_large: "MESSAGE TOO LARGE",
+  webhook_timeout: "RELAY TIMED OUT REACHING GM",
+  webhook_unreachable: "RELAY COULD NOT REACH GM",
+  webhook_failed: "GM ENDPOINT REJECTED THE MOVE",
+  not_configured: "RELAY NOT CONFIGURED",
+};
+
+// Move goes straight to the Cloudflare Worker, which forwards it to red gm and
+// answers with the delivery result. That HTTP answer is the ack.
+async function publishViaWorker(body) {
+  for (let pass_try = 0; pass_try < 2; pass_try++) {
+    const pass = getPassphrase(pass_try > 0);
+    if (!pass) throw new PublishError("PASSPHRASE NEEDED");
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 15000);
+    let r;
+    try {
+      r = await fetch(`${WORKER_URL}/act`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Page-Pass": pass },
+        body: JSON.stringify(body),
+        signal: ctl.signal,
+        cache: "no-store",
+      });
+    } catch (err) {
+      throw new PublishError(describeFetchFailure(err), String(err && err.message || err));
+    } finally {
+      clearTimeout(timer);
+    }
+    let data = {};
+    try { data = await r.json(); } catch (_) { /* non-JSON error page */ }
+    if (r.ok && data.ok) return { delivered: !!data.delivered };
+    if (r.status === 401) {
+      localStorage.removeItem("campaign_pass");
+      if (pass_try === 0) continue;   // ask again once
+    }
+    const retryAfter = Number(r.headers.get("retry-after")) || Number(data.retry_after) || 0;
+    let why = WORKER_ERRORS[data.error] || `RELAY ERROR ${data.error || ""}`.trim();
+    if (r.status === 429) why = `RATE LIMITED — RETRY IN ${retryAfter || 10}S`;
+    why += ` (HTTP ${r.status}${data.status ? "/" + data.status : ""})`;
+    const e = new PublishError(why, "worker " + r.status + " " + (data.error || ""));
+    e.status = r.status;
+    e.retryAfter = retryAfter;
+    throw e;
+  }
+  throw new PublishError("PASSPHRASE NEEDED");
+}
+
 async function publishOnce(body, test) {
+  if (WORKER_URL) return publishViaWorker(body);
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 10000);
   let r;
@@ -917,11 +980,10 @@ async function publishAction(id, text, chosenVoice, test = false, via = "") {
   let lastErr;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      await publishOnce(body, test);
-      return;
+      return (await publishOnce(body, test)) || { delivered: false };
     } catch (err) {
       lastErr = err;
-      const retriable = !err.status || err.status === 429 || err.status >= 500;
+      const retriable = (!err.status && err.reason !== "PASSPHRASE NEEDED") || err.status === 429 || err.status >= 500;
       if (!retriable || attempt === 3) break;
       const wait = err.status === 429 ? Math.min(6, Math.max(1, err.retryAfter || 2)) : attempt;
       const move = moves.get(id);
@@ -950,8 +1012,9 @@ async function retryMove(id) {
   try {
     publishedIds.delete(id);
     publishedIds.add(id);
-    await publishAction(id, move.text, move.voice, move.test, "retry");
-    if (moves.get(id)?.stage === "sending") setMoveStage(id, "sent", { sentOkAt: Date.now() });
+    const res = await publishAction(id, move.text, move.voice, move.test, "retry");
+    if (res && res.delivered) handleEvent({ type: "ack", id, stage: "forwarded", lag: 0 });
+    else if (moves.get(id)?.stage === "sending") setMoveStage(id, "sent", { sentOkAt: Date.now() });
   } catch (err) {
     publishedIds.delete(id);
     setMoveStage(id, "error", { error: "SEND FAILED · " + (err.reason || String(err.message || err).toUpperCase()), retryMode: "resend" });
@@ -1014,8 +1077,12 @@ async function dispatchSend(ev) {
   try {
     if (publishedIds.has(ev.id)) return;
     publishedIds.add(ev.id);
-    await publishAction(ev.id, ev.text, ev.voice, !!ev.test, ev.via);
-    if (moves.get(ev.id)?.stage === "sending") setMoveStage(ev.id, "sent", { sentOkAt: Date.now() });
+    const res = await publishAction(ev.id, ev.text, ev.voice, !!ev.test, ev.via);
+    if (res && res.delivered) {
+      handleEvent({ type: "ack", id: ev.id, stage: "forwarded", lag: 0 });   // the Worker's answer is the ack
+    } else if (moves.get(ev.id)?.stage === "sending") {
+      setMoveStage(ev.id, "sent", { sentOkAt: Date.now() });
+    }
   } catch (err) {
     publishedIds.delete(ev.id);
     setMoveStage(ev.id, "error", {

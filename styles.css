@@ -1,4 +1,4 @@
-/* cache-bust: 20261121h */
+/* cache-bust: 20261121i */
 :root {
   --bg: #161311;
   --bg-2: #1c1916;
@@ -486,7 +486,7 @@ h1 {
   color: var(--muted);
 }
 
-/* ---- UX 20261121h: status, stages, play, dock ---- */
+/* ---- UX 20261121i: status, stages, play, dock ---- */
 :root { --kb: 0px; }
 
 button, .icon-btn, .replay, .play-btn, .retry-btn, .status-stop, #enter, #send {
@@ -655,7 +655,7 @@ button, .icon-btn, .replay, .play-btn, .retry-btn, .status-stop, #enter, #send {
   scroll-padding-bottom: 24px;
 }
 
-/* ---- 20261121h: sent / delivered attribution, keyboard-open dock ---- */
+/* ---- 20261121i: sent / delivered attribution, keyboard-open dock ---- */
 .status-bar[data-stage="sent"] { border-left-color: var(--yellow); color: var(--yellow); }
 .status-bar[data-stage="sent"][data-slow="1"] { border-left-color: var(--red); color: var(--red); }
 .msg .stage[data-stage="sent"] { color: var(--yellow); }

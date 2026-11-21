@@ -1,12 +1,14 @@
-import { NTFY_TOPIC, NTFY_BASE, KALE_MODEL, KALE_FRONTEND, DEFAULT_VOICE } from "./config.js?v=20261121f";
-import { KaleTTS } from "./vendor/kale-tts.mjs?v=20261121f";
+import { NTFY_TOPIC, NTFY_BASE, KALE_MODEL, KALE_FRONTEND, DEFAULT_VOICE } from "./config.js?v=20261121g";
+import { KaleTTS } from "./vendor/kale-tts.mjs?v=20261121g";
 
-const ASSET_V = "20261121f";
+const ASSET_V = "20261121g";
 const SILENCE =
   "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
 const MODEL_URL = `${KALE_MODEL}kale-tts-1-nano.onnx`;
 const REPLY_TIMEOUT_MS = 180000;
 const ACK_TIMEOUT_MS = 30000;
+const SLOW_RELAY_S = 12;
+const NO_DELIVERY_MS = 180000;
 
 const FALLBACK_VOICES = [
   { name: "Magnus", id: "h013f", label: "Magnus · deep dramatic trailer narrator" },
@@ -102,12 +104,43 @@ function scrollToLatest() {
   });
 }
 
-function syncKeyboard() {
+// The app is pinned to the *visual* viewport (top/height from visualViewport)
+// so the composer sits right above the iOS keyboard. While a finger is on the
+// dock (and shortly after) we do NOT re-layout: on real iOS the visualViewport
+// resize/scroll events fire around the first touch, and moving the Send button
+// between touchstart and touchend is what swallows the first tap.
+let dockGestureUntil = 0;
+let syncPending = false;
+let syncTimer = null;
+
+function holdLayout(ms = 900) {
+  dockGestureUntil = Math.max(dockGestureUntil, Date.now() + ms);
+}
+
+function applyViewport() {
+  syncPending = false;
   const vv = window.visualViewport;
+  const root = document.documentElement.style;
   if (!vv) return;
+  const wait = dockGestureUntil - Date.now();
+  if (wait > 0) {
+    // layout is frozen; apply once the gesture window has closed
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(syncKeyboard, wait + 30);
+    return;
+  }
+  root.setProperty("--vv-top", Math.max(0, Math.round(vv.offsetTop)) + "px");
+  root.setProperty("--vv-h", Math.round(vv.height) + "px");
   const kb = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
-  document.documentElement.style.setProperty("--kb", kb + "px");
+  root.setProperty("--kb", kb + "px");
+  document.documentElement.classList.toggle("kb-open", kb > 80);
   scrollToLatest();
+}
+
+function syncKeyboard() {
+  if (syncPending) return;
+  syncPending = true;
+  requestAnimationFrame(applyViewport);
 }
 
 function resumeAudio() {
@@ -176,6 +209,7 @@ function parseNtfy(raw) {
     text: String(payload.text || ""),
     voice: payload.voice,
     stage: payload.stage,
+    lag: Number(payload.lag) || 0,
     test: payload.test === true,
     ts: data.time || payload.ts || Date.now() / 1000,
     ntfyId: hasEnvelope ? data.id : data.ntfyId,
@@ -212,7 +246,15 @@ function fillVoices(list) {
 function stageCopy(move) {
   const stage = move.stage;
   if (stage === "sending") return "SENDING…";
-  if (stage === "delivered") return "DELIVERED";
+  if (stage === "sent") {
+    const s = Math.floor((Date.now() - (move.sentOkAt || Date.now())) / 1000);
+    if (s >= SLOW_RELAY_S) return `SENT · RELAY SLOW (${formatElapsed(s * 1000)}) — GM BOX MAY BE ASLEEP`;
+    return `SENT · WAITING FOR RELAY ${formatElapsed(s * 1000)}`;
+  }
+  if (stage === "delivered") {
+    const lag = move.lag || 0;
+    return lag >= 10 ? `DELIVERED TO GM (RELAY WAS ${lag}S LATE)` : "DELIVERED TO GM";
+  }
   if (stage === "writing") {
     const ms = Date.now() - (move.writingStartedAt || Date.now());
     return `GM IS WRITING  ${formatElapsed(ms)}`;
@@ -229,6 +271,7 @@ function refreshStatusBar() {
     [...moves.values()].reverse().find((m) => !["done", "idle"].includes(m.stage));
   const stage = move ? move.stage : "idle";
   statusBar.dataset.stage = stage;
+  statusBar.dataset.slow = move && stage === "sent" && Date.now() - (move.sentOkAt || Date.now()) >= SLOW_RELAY_S * 1000 ? "1" : "0";
   statusBarLabel.textContent = move ? stageCopy(move) : "IDLE";
   statusStop.hidden = !(move && move.stage === "speaking");
 }
@@ -306,6 +349,14 @@ function setMoveStage(id, stage, extra = {}) {
       }
     }, ACK_TIMEOUT_MS);
   }
+  if (stage === "sent") {
+    move.sentOkAt = move.sentOkAt || Date.now();
+    move.relayTimer = setTimeout(() => {
+      if (moves.get(id)?.stage === "sent") {
+        setMoveStage(id, "error", { error: "NO DELIVERY CONFIRMATION", retryMode: "wait", sentOkAt: 0 });
+      }
+    }, NO_DELIVERY_MS);
+  }
   if (stage === "writing" || stage === "delivered") {
     const started = move.writingStartedAt || Date.now();
     const remain = REPLY_TIMEOUT_MS - (Date.now() - started);
@@ -325,16 +376,21 @@ function setMoveStage(id, stage, extra = {}) {
 function clearMoveTimers(move) {
   if (move.ackTimer) { clearTimeout(move.ackTimer); move.ackTimer = null; }
   if (move.replyTimer) { clearTimeout(move.replyTimer); move.replyTimer = null; }
+  if (move.relayTimer) { clearTimeout(move.relayTimer); move.relayTimer = null; }
 }
 
 function tickBars() {
   for (const move of moves.values()) {
+    if (move.stage === "sent" && move.stageEl) {
+      move.stageEl.textContent = stageCopy(move);
+      move.stageEl.dataset.slow = Date.now() - (move.sentOkAt || Date.now()) >= SLOW_RELAY_S * 1000 ? "1" : "0";
+    }
     if (move.stage === "writing" && move.elapsedEl) {
       move.elapsedEl.textContent = formatElapsed(Date.now() - (move.writingStartedAt || Date.now()));
     }
   }
   const current = activeMoveId && moves.get(activeMoveId);
-  if (current && current.stage === "writing") refreshStatusBar();
+  if (current && ["writing", "sent"].includes(current.stage)) refreshStatusBar();
 }
 
 function escapeAttr(id) {
@@ -374,7 +430,7 @@ function findExistingAction(ev) {
     if (!move || !move.el) continue;
     if (String(move.text || "").trim() !== text) continue;
     const age = now - (move.sentAt || 0);
-    const inFlight = ["sending", "delivered", "writing"].includes(move.stage);
+    const inFlight = ["sending", "sent", "delivered", "writing"].includes(move.stage);
     if (inFlight && age < 20000) return move;
   }
   return null;
@@ -697,8 +753,8 @@ async function handleEvent(ev, { historic = false } = {}) {
   }
   if (ev.type === "ack") {
     const move = moves.get(ev.id) || ensureActionRow({ id: ev.id, text: ev.text || "…", test: ev.test });
-    if (["sending", "idle"].includes(move.stage || "idle") || !move.stage) {
-      setMoveStage(ev.id, "delivered");
+    if (["sending", "sent", "idle", "error"].includes(move.stage || "idle") || !move.stage) {
+      setMoveStage(ev.id, "delivered", { lag: ev.lag || 0, error: "", retryMode: "" });
       setTimeout(() => {
         if (moves.get(ev.id)?.stage === "delivered") setMoveStage(ev.id, "writing");
       }, 700);
@@ -804,8 +860,9 @@ function connectChannel() {
   pollTimer = setInterval(pollOnce, 2000);
 }
 
-async function publishAction(id, text, chosenVoice, test = false) {
-  const body = { type: "action", id, text, voice: chosenVoice };
+async function publishAction(id, text, chosenVoice, test = false, via = "") {
+  const body = { type: "action", id, text, voice: chosenVoice, build: ASSET_V };
+  if (via) body.via = via;
   if (test) body.test = true;
   const r = await fetch(`${NTFY_BASE}/${encodeURIComponent(NTFY_TOPIC)}`, {
     method: "POST",
@@ -820,14 +877,19 @@ async function retryMove(id) {
   if (!move) return;
   resumeAudio();
   if (move.retryMode === "wait") {
-    setMoveStage(id, "writing", { writingStartedAt: Date.now(), error: "", retryMode: "" });
+    if (move.sentOkAt === 0 || move.error === "NO DELIVERY CONFIRMATION") {
+      setMoveStage(id, "sent", { sentOkAt: Date.now(), error: "", retryMode: "" });
+    } else {
+      setMoveStage(id, "writing", { writingStartedAt: Date.now(), error: "", retryMode: "" });
+    }
     return;
   }
   setMoveStage(id, "sending", { error: "", retryMode: "" });
   try {
     publishedIds.delete(id);
     publishedIds.add(id);
-    await publishAction(id, move.text, move.voice, move.test);
+    await publishAction(id, move.text, move.voice, move.test, "retry");
+    if (moves.get(id)?.stage === "sending") setMoveStage(id, "sent", { sentOkAt: Date.now() });
   } catch (err) {
     publishedIds.delete(id);
     setMoveStage(id, "error", { error: "SEND FAILED", retryMode: "resend" });
@@ -843,11 +905,12 @@ function newMoveId() {
     Math.random().toString(16).slice(2) + Date.now().toString(16);
 }
 
-// Capture the move on the first pointer/touch: disable Send immediately,
-// keep the textarea focused, and do not wait for click. A leftover click,
-// a second event from the same gesture, or a second tap while in-flight
-// cannot start another send.
-function captureSend() {
+// One physical tap == one send. The move is captured the instant the first
+// pointer/touch event reaches the button (before any audio work, before any
+// await), Send is disabled and the field cleared, so every later event of the
+// same gesture (touchstart -> pointerdown -> touchend -> click -> submit) finds
+// an empty field / a held lock and does nothing.
+function captureSend(via = "") {
   const now = Date.now();
   if (sendInFlight || sendBtn.disabled || now < sendLockUntil) return null;
   const text = input.value.trim();
@@ -855,14 +918,8 @@ function captureSend() {
   sendInFlight = true;
   sendLockUntil = now + 1000;
   sendBtn.disabled = true;
+  sendBtn.textContent = "SENT ✓";
   input.value = "";
-  // Delay collapsing the field so the Send button does not move under a
-  // still-down finger if the textarea was taller than one line.
-  requestAnimationFrame(() => {
-    setTimeout(() => {
-      if (!input.value) input.style.height = "auto";
-    }, 350);
-  });
   const ev = {
     type: "action",
     id: newMoveId(),
@@ -870,21 +927,25 @@ function captureSend() {
     voice: voiceSel.value,
     ts: Date.now() / 1000,
     test: isTestEvent({ text }),
+    via,
   };
   ev.local = true;
   ensureActionRow(ev);
   setMoveStage(ev.id, "sending");
+  holdLayout(1200);
   scrollToLatest();
+  // collapse the field after the gesture is over, never under a finger
+  setTimeout(() => { if (!input.value) input.style.height = "auto"; }, 500);
   return ev;
 }
 
 async function dispatchSend(ev) {
-  resumeAudio();
-  unlockAudio().catch(() => {});
+  try { resumeAudio(); unlockAudio().catch(() => {}); } catch (_) { /* audio is optional */ }
   try {
     if (publishedIds.has(ev.id)) return;
     publishedIds.add(ev.id);
-    await publishAction(ev.id, ev.text, ev.voice, !!ev.test);
+    await publishAction(ev.id, ev.text, ev.voice, !!ev.test, ev.via);
+    if (moves.get(ev.id)?.stage === "sending") setMoveStage(ev.id, "sent", { sentOkAt: Date.now() });
   } catch (err) {
     publishedIds.delete(ev.id);
     setMoveStage(ev.id, "error", { error: "SEND FAILED", retryMode: "resend" });
@@ -893,42 +954,49 @@ async function dispatchSend(ev) {
     sendInFlight = false;
     const remain = Math.max(0, sendLockUntil - Date.now());
     setTimeout(() => {
-      if (!sendInFlight) sendBtn.disabled = false;
-    }, remain);
+      if (!sendInFlight) {
+        sendBtn.disabled = false;
+        sendBtn.textContent = "SEND";
+      }
+    }, remain + 350);
     if (document.activeElement !== input) {
       try { input.focus({ preventScroll: true }); } catch (_) { input.focus(); }
     }
   }
 }
 
-function onSendPointer(e) {
-  if (e.type === "pointerdown" && e.button != null && e.button !== 0) return;
-  // preventDefault on touchstart/pointerdown (not touchend) is what stops
-  // iOS Safari from using the first tap only to blur the textarea and
-  // dismiss the keyboard — which shifts the composer and drops the click.
-  if (e.cancelable) e.preventDefault();
-  if (e.stopPropagation) e.stopPropagation();
-  resumeAudio();
-  const ev = captureSend();
+function sendFrom(via, e) {
+  if (e && e.cancelable) e.preventDefault();
+  const ev = captureSend(via);   // first: nothing before this may throw or await
   if (ev) dispatchSend(ev);
+  else try { resumeAudio(); } catch (_) { /* ignore */ }
+  return ev;
 }
 
-form.addEventListener("submit", (e) => {
-  e.preventDefault();
-  resumeAudio();
-  const ev = captureSend();
-  if (ev) dispatchSend(ev);
-});
+form.addEventListener("submit", (e) => { sendFrom("submit", e); });
 
-sendBtn.addEventListener("pointerdown", onSendPointer, { passive: false });
-sendBtn.addEventListener("touchstart", onSendPointer, { passive: false });
+// iOS Safari: these must be non-passive or preventDefault is ignored, and they
+// run on the FIRST touch so the keyboard/blur/layout shift cannot eat the tap.
+const gestureOpts = { passive: false, capture: true };
+sendBtn.addEventListener("touchstart", (e) => { holdLayout(1500); sendFrom("touchstart", e); }, gestureOpts);
+sendBtn.addEventListener("pointerdown", (e) => {
+  if (e.button != null && e.button !== 0) return;
+  holdLayout(1500);
+  sendFrom("pointerdown", e);
+}, gestureOpts);
+sendBtn.addEventListener("mousedown", (e) => { e.preventDefault(); }, gestureOpts);   // keep textarea focus
+sendBtn.addEventListener("touchend", (e) => { holdLayout(900); sendFrom("touchend", e); }, gestureOpts);
+sendBtn.addEventListener("click", (e) => { sendFrom("click", e); }, gestureOpts);
+// anything touching the dock holds the layout still for the gesture
+const dock = document.getElementById("dock");
+for (const type of ["touchstart", "pointerdown"]) {
+  dock.addEventListener(type, () => holdLayout(1500), { passive: true, capture: true });
+}
+dock.addEventListener("touchend", () => holdLayout(900), { passive: true, capture: true });
 
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    resumeAudio();
-    const ev = captureSend();
-    if (ev) dispatchSend(ev);
+    sendFrom("enter", e);
   }
 });
 
@@ -940,9 +1008,10 @@ input.addEventListener("input", () => {
   if (input.value.trim() && !sendInFlight) {
     sendLockUntil = 0;
     sendBtn.disabled = false;
+    sendBtn.textContent = "SEND";
   }
 });
-input.addEventListener("focus", syncKeyboard);
+input.addEventListener("focus", () => { syncKeyboard(); setTimeout(syncKeyboard, 350); });
 
 voiceSel.addEventListener("change", () => {
   voice = voiceSel.value;
@@ -967,6 +1036,7 @@ if (window.visualViewport) {
   visualViewport.addEventListener("scroll", syncKeyboard);
 }
 
+syncKeyboard();
 fillVoices(FALLBACK_VOICES);
 setMuteUi();
 setLinkStatus("off", "OFFLINE");

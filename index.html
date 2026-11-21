@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#161311">
+  <title>NETLINK — Time of the Red</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="preconnect" href="https://huggingface.co">
+  <link rel="preconnect" href="https://cdn.jsdelivr.net">
+  <link href="https://fonts.googleapis.com/css2?family=Black+Ops+One&family=IBM+Plex+Mono:wght@400;500&family=Oswald:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "onnxruntime-web": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.bundle.min.mjs"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div class="grime" aria-hidden="true"></div>
+  <div class="halftone" aria-hidden="true"></div>
+  <div class="scanlines" aria-hidden="true"></div>
+
+  <div class="gate" id="gate">
+    <div class="gate-card">
+      <h2>NETLINK / SOLO RUN</h2>
+      <p>Tap once to open the channel and unlock the narrator. The voice model downloads the first time (about 15&nbsp;MB).</p>
+      <button type="button" id="enter">Enter Night City</button>
+    </div>
+  </div>
+
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <p class="eyebrow">CYBERPUNK RED · TIME OF THE RED · 2045</p>
+        <h1>NETLINK<span class="slash"> / </span>SOLO RUN</h1>
+      </div>
+      <div class="toolbar">
+        <div class="led" id="status" data-state="off" title="Link status">
+          <span class="dot"></span>
+          <span class="led-label">OFFLINE</span>
+        </div>
+        <label class="voice-wrap">
+          <span class="sr-only">Voice</span>
+          <select id="voice" aria-label="Narrator voice"></select>
+        </label>
+        <button type="button" id="mute" class="icon-btn" aria-pressed="false" aria-label="Mute autoplay">
+          <span class="mute-icon" aria-hidden="true">♪</span>
+          <span class="mute-label">LIVE</span>
+        </button>
+      </div>
+    </header>
+
+    <p class="voice-status" id="voice-status">Voice: not loaded</p>
+    <main id="log" class="log" aria-live="polite"></main>
+
+    <div id="waiting" class="waiting" hidden>
+      <span class="pulse"></span>
+      waiting for the GM…
+    </div>
+
+    <form id="composer" class="composer" autocomplete="off">
+      <label class="sr-only" for="action">What do you do?</label>
+      <textarea id="action" rows="2" maxlength="4000" placeholder="What do you do?" enterkeyhint="send" required></textarea>
+      <button type="submit" id="send">SEND</button>
+    </form>
+    <p class="disclaimer">Voice is AI-generated · Kale TTS · English only</p>
+  </div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
